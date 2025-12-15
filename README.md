@@ -130,8 +130,6 @@ python3 smartmeter_kaifa_ma309_ha_mqtt.py \
 
 For 24/7 operation on a Raspberry Pi, it is recommended to run the script as a **systemd service**.
 
-A sample service file can be found in the `systemd/` directory or created manually.
-
 ---
 
 ## 📈 Typical Use Cases
