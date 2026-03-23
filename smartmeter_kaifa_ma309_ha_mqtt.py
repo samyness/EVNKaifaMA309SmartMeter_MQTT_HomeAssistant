@@ -88,6 +88,8 @@ class BridgeState:
         self.last_state_publish_monotonic = 0.0
         self.last_serial_reopen_monotonic = 0.0
         self.service_online = False
+        self.device_online = False
+        self.last_device_status_publish_monotonic = 0.0
         self.packet_counter = 0
         self.decode_error_counter = 0
         self.serial_error_counter = 0
@@ -397,6 +399,7 @@ class MqttBridge:
         self.args = args
         self.bridge_state = bridge_state
         self.service_availability_topic = f"{args.base_topic}/bridge/availability"
+        self.device_availability_topic: Optional[str] = None
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=args.mqtt_client_id)
         if args.mqtt_user or args.mqtt_pass:
             self.client.username_pw_set(args.mqtt_user, args.mqtt_pass)
@@ -412,6 +415,11 @@ class MqttBridge:
     def stop(self) -> None:
         try:
             self.publish_service_availability(False)
+            if self.bridge_state.device_id:
+                try:
+                    self.publish_device_availability(self.bridge_state.device_id, False)
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
@@ -441,8 +449,23 @@ class MqttBridge:
         )
         self.bridge_state.service_online = online
 
+    def ensure_device_availability_topic(self, device_id: str) -> str:
+        topic = f"{self.args.base_topic}/{device_id}/status"
+        self.device_availability_topic = topic
+        return topic
+
+    def publish_device_availability(self, device_id: str, online: bool) -> None:
+        topic = self.ensure_device_availability_topic(device_id)
+        payload = "online" if online else "offline"
+        mqtt_wait_publish(self.client.publish(topic, payload, qos=1, retain=True), topic)
+        self.bridge_state.device_online = online
+        self.bridge_state.last_device_status_publish_monotonic = time.monotonic()
+
     def publish_discovery(self, device_id: str, device_name: str) -> None:
         state_topic = f"{self.args.base_topic}/{device_id}/state"
+        device_avail_topic = self.ensure_device_availability_topic(device_id)
+        # Ensure HA availability is online before (re)publishing discovery
+        self.publish_device_availability(device_id, True)
         device_payload = {
             "identifiers": [device_id],
             "name": device_name,
@@ -458,7 +481,10 @@ class MqttBridge:
                 "name": sdef["name"],
                 "unique_id": unique_id,
                 "state_topic": state_topic,
-                "availability_topic": self.service_availability_topic,
+                "availability_topic": device_avail_topic,
+                "payload_available": "online",
+                "payload_not_available": "offline",
+                "expire_after": int(max(180, self.args.offline_after_seconds + 60)),
                 "value_template": "{{ value_json.%s }}" % sensor_key,
                 "device": device_payload,
             }
@@ -474,6 +500,9 @@ class MqttBridge:
 
     def publish_state(self, device_id: str, state: Dict[str, Any], raw: Dict[str, Any]) -> None:
         state_topic = f"{self.args.base_topic}/{device_id}/state"
+        device_avail_topic = self.ensure_device_availability_topic(device_id)
+        # Ensure HA availability is online before (re)publishing discovery
+        self.publish_device_availability(device_id, True)
         raw_topic = f"{self.args.base_topic}/{device_id}/raw"
         mqtt_wait_publish(self.client.publish(state_topic, json.dumps(state), qos=1, retain=True), state_topic)
         self.client.publish(raw_topic, json.dumps(raw), qos=0, retain=False)
@@ -591,6 +620,12 @@ def maybe_mark_offline(mq: MqttBridge, bridge_state: BridgeState, args: argparse
     if age >= args.offline_after_seconds and bridge_state.service_online and bridge_state.connected:
         try:
             mq.publish_service_availability(False)
+            if bridge_state.device_id:
+                try:
+                    mq.publish_device_availability(bridge_state.device_id, False)
+                except Exception:
+                    pass
+            bridge_state.device_online = False
             LOG.warning("Keine gültigen Pakete seit %.0fs – Availability auf offline gesetzt", age)
         except Exception as exc:
             bridge_state.mqtt_error_counter += 1
@@ -724,6 +759,13 @@ def main() -> None:
                         except Exception as exc:
                             bridge_state.mqtt_error_counter += 1
                             LOG.warning("Availability online publish fehlgeschlagen: %s", exc)
+
+                    if bridge_state.connected and bridge_state.device_id and not bridge_state.device_online:
+                        try:
+                            mq.publish_device_availability(bridge_state.device_id, True)
+                        except Exception as exc:
+                            bridge_state.mqtt_error_counter += 1
+                            LOG.warning("Device availability online publish fehlgeschlagen: %s", exc)
 
                     if bridge_state.connected and bridge_state.device_id and not bridge_state.discovery_sent:
                         try:
